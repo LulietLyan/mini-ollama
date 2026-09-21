@@ -1,0 +1,7 @@
+third_party/llama.cpp/
+build/
+models/*.gguf
+.vscode/
+__pycache__/
+*.py[cod]
+.DS_Store
