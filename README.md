@@ -1,150 +1,181 @@
-<img src="./image/line-neon.gif" width=100%><br>
+# mini-ollama
 
-<div id="user-content-toc">
-  <ul align="center">
-    <summary><h1 style="display: inline-block"><b>🌠 README-Template: A Quickstart For Your Projects</b></h1></summary>
-    <a href="https://github.com/LulietLyan/README-Template"><strong>查看文档 »</strong></a>
-    <br />
-    <a href="https://github.com/LulietLyan/README-Template">演示</a>
-    &middot;
-    <a href="https://github.com/LulietLyan/README-Template/issues/new?labels=bug&template=bug-report---.md">Bugs</a>
-    &middot;
-    <a href="https://github.com/LulietLyan/README-Template/issues/new?labels=enhancement&template=feature-request---.md">特性</a>
-  </ul>
-</div>
+mini-ollama is a Go command-line application for running local GGUF models through llama.cpp `llama-server`. It provides a persistent local service, a custom HTTP API, a CLI chat client, and a Bubble Tea terminal interface.
 
-<p align="center"> 
-    <img src="https://img.shields.io/github/followers/LulietLyan?label=Followers&style=for-the-badge&color=purple"alt="github follow"/>
-    <img src="https://img.shields.io/github/stars/LulietLyan/README-Template?label=Stars&style=for-the-badge"
-    alt="github repo stars" >
-    <img src="https://img.shields.io/github/contributors/LulietLyan/README-Template?style=for-the-badge&logoColor=%23985684"
-    alt="contributors" >
-    <img src="https://img.shields.io/github/issues-pr/LulietLyan/README-Template?style=for-the-badge&color=%23985684"
-    alt="issues-pr" >
-    <img src="https://img.shields.io/github/issues/LulietLyan/README-Template?style=for-the-badge&color=%23777777" 
-    alt="issues" >
-    <img src="https://img.shields.io/github/forks/LulietLyan/README-Template?style=for-the-badge&color=%23187777" 
-    alt="forks" >
-    <img src="https://img.shields.io/badge/Contributions-Welcome-%23028745?style=for-the-badge&labelColor=%23b08f42"
-    alt="contribution"/>
-    <img src="https://img.shields.io/badge/Star-IfYouLike-%23067897?style=for-the-badge&labelColor=%23879078"
-    alt="star"/>
-    <img src="https://img.shields.io/github/license/LulietLyan/README-Template?style=for-the-badge"
-    alt="license" >
-</p>
+Linux with CUDA is the primary validation target. The project loads one model at a time and uses `CUDA_VISIBLE_DEVICES` to select the visible CUDA device. Multi-GPU scheduling, remote access, authentication, and an OpenAI-compatible API are not part of the current implementation.
 
-<p align="center"> 
-<a href="https://github.com/LulietLyan/README-Template"><img src="./image/SYSU.svg" height=50pt alt="lulietlyan" /></a>
-<a href="https://github.com/LulietLyan/README-Template"><img src="./image/NSCC-GZ.svg" height=50pt alt="lulietlyan" /></a>
-</p>
+## Current Features
 
-<img src="./image/line-neon.gif" width=100%><br>
+- `serve` keeps the mini-ollama API running and owns the llama-server process.
+- `models` scans a model directory, reads optional `manifest.json` metadata, and verifies size and SHA-256 values.
+- `run` starts llama-server directly for a GGUF path.
+- `chat` sends multi-turn messages through the mini-ollama API and prints SSE tokens.
+- `tui` provides model selection, explicit model switching, stopping, directory refresh, and streaming chat.
+- `stop` and `switch MODEL` control the single loaded model explicitly.
+- SQLite stores conversations and messages for the custom chat API.
+- `import-hf` downloads a fixed Hugging Face revision, converts HF weights to GGUF, quantizes Q4_K_M, verifies output, and publishes a model manifest.
+- Model files, download caches, conversion files, and published GGUF files can be kept outside the source tree.
 
-# 📕 目录
-- [📕 目录](#-目录)
-- [🤔 项目背景](#-项目背景)
-  - [设计理念](#设计理念)
-- [😋 快速上手指南](#-快速上手指南)
-  - [克隆仓库](#克隆仓库)
-  - [开始项目](#开始项目)
-- [❓ 待办事项](#-待办事项)
-- [🤝 代码贡献](#-代码贡献)
-  - [代码贡献人员](#代码贡献人员)
-- [❓ 联系作者](#-联系作者)
-- [❗ 授权说明](#-授权说明)
+## Architecture
 
+```mermaid
+flowchart LR
+    User[CLI or TUI] --> API[mini-ollama serve<br/>Gin HTTP API]
+    Client[HTTP client] --> API
+    Run[run MODEL] --> Runner[runner]
+    API --> Catalog[Model catalog]
+    API --> History[SQLite history]
+    API --> Controller[Single model controller]
+    Controller --> Server[llama-server]
+    Runner --> Server
+    Server --> Backend[CUDA or Metal backend]
+    Import[import-hf] --> Models[GGUF model directory]
+    Models --> Catalog
+```
 
-# 🤔 项目背景
+In API mode, `serve` owns the llama-server process. `run MODEL` is the separate direct process path. The TUI and external clients communicate with `serve`; they do not start another model process. The API exposes model names and keeps local GGUF paths inside the server.
 
-**README-Template** 致力于构建一个统一而美观的 README 模板，让您从此无需重复造轮子——这正是本项目的核心价值。
+## Request Workflow
 
-<p align="right">(<a href="#readme-top">返回顶部</a>)</p>
+```mermaid
+sequenceDiagram
+    participant User
+    participant Client as CLI/TUI
+    participant Mini as mini-ollama serve
+    participant DB as SQLite
+    participant Llama as llama-server
 
-## 设计理念
+    User->>Client: choose model
+    Client->>Mini: service switch(model)
+    Mini->>Llama: start GGUF process
+    Llama-->>Mini: GET /health succeeds
+    Mini-->>Client: model ready
+    User->>Client: enter message
+    Client->>Mini: POST /api/v1/chat
+    Mini->>DB: read history and append user message
+    Mini->>Llama: POST /v1/chat/completions
+    Llama-->>Mini: SSE token stream
+    Mini->>DB: append assistant message
+    Mini-->>Client: token and done events
+```
 
-- 开发者精力应聚焦于创造价值，而非撰写文档
-- 避免从零开始编写 README 的重复劳动
-- 将 DRY（Don't Repeat Yourself）原则延伸至工作全流程 😊
+## Requirements
 
-我们深知单一模板难以满足所有场景需求（不同项目的文档要求千差万别）。近期将持续完善模板体系，您也可以通过以下方式参与共建：
-- **Fork** 仓库并提交拉取请求
-- 创建改进提案的讨论议题
+- Go 1.25 or later.
+- A built llama.cpp `llama-server` at `build/llama-server/bin/llama-server`.
+- Linux with CUDA for the primary path. The build script also contains a macOS arm64 Metal configuration.
+- Python dependencies for HF conversion are installed in a conda environment.
 
-特别鸣谢所有为模板生态作出贡献的开发者！
+The source tree treats `third_party/llama.cpp` as an external checkout. The official Ollama source is reference material only and is not part of the build or runtime path.
 
-<p align="right">(<a href="#readme-top">返回顶部</a>)</p>
+## Build llama.cpp
 
-# 😋 快速上手指南
+Run the setup and build scripts from the repository root:
 
-以下演示如何快速完成项目本地化部署，助您轻松使用 **README\.md** 模板。
+```bash
+source ~/.bashrc
+./scripts/bootstrap.sh
+./scripts/build-llama-server.sh
+cmake --build build/llama-server --target llama-quantize --parallel 4
+go build -o /tmp/mini-ollama .
+```
 
-## 克隆仓库
+On Linux, the build script enables CUDA and uses CUDA architecture 86 for RTX 3090-class GPUs. Keep model files and large build or conversion outputs on the external model storage selected for the machine.
 
-作者已经将本项目设置为模板，每次建立新的仓库时可以指定使用本模板，无需手动复制粘贴。貌似被设置为模板的项目在被 **Fork** 时也是模板的状态，因此在您 Fork 后可以轻松地使用本模板。
+## Model Directory
 
-点击 [Fork](https://github.com/LulietLyan/README-Template/fork) 按钮将项目拉取至您的仓库。
+The default model directory is `~/.mini-ollama/models`. Override it with `--models-dir` or `MINI_OLLAMA_MODELS_DIR`.
 
-## 开始项目
+A directory containing one GGUF file is a model entry. A directory may also contain `manifest.json`:
 
-1. **克隆到本地**
-  ```bash
-    git clone https://github.com/你的用户名/README-Template.git
-    cd README-Template
-  ```
-2. **修改模板内容**
-  编辑 **README\.md** 文件，按照您的项目需求调整内容。
-3. **提交更改**
-  ```bash
-    git add .
-    git commit -m "docs: 更新README内容"
-    git push origin main
-  ```
-4. **在项目中使用**
-  直接作为项目主文档
-  或复制模板内容到其他项目的 **README\.md**
+```text
+models/
+└── Llama-3.2-1B-Instruct-GGUF/
+    ├── Llama-3.2-1B-Instruct-GGUF.Q4_K_M.gguf
+    └── manifest.json
+```
 
-<p align="right">(<a href="#readme-top">返回顶部</a>)</p>
+The catalog uses the directory name by default. A manifest can provide the displayed name, description, selected GGUF file, size, and SHA-256 value.
 
-# ❓ 待办事项
+## Run the Service
 
-- [√] 中文版本
-- [ ] English Version
-- [ ] 能否实现工具化
+The API listens on `127.0.0.1:11434` by default. Keep the SQLite directory on a local writable filesystem when the model directory is a CephFS/NFS mount; the model and conversion files can remain on CephFS.
 
-<p align="right">(<a href="#readme-top">返回顶部</a>)</p>
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+/tmp/mini-ollama serve \
+  --models-dir /path/to/models \
+  --data-dir /tmp/mini-ollama-data \
+  --device 0 \
+  --gpu-layers all
+```
 
-# 🤝 代码贡献
+Useful commands:
 
-开源社区之所以能成为学习、交流与创新的绝佳平台，正是源于每一位参与者的无私奉献。我们诚挚感谢您以任何形式为项目添砖加瓦。
+```bash
+/tmp/mini-ollama models --models-dir /path/to/models --verify
+/tmp/mini-ollama models --models-dir /path/to/models --refresh
+/tmp/mini-ollama switch MODEL_NAME
+/tmp/mini-ollama stop
+/tmp/mini-ollama chat MODEL_NAME
+/tmp/mini-ollama tui --server http://127.0.0.1:11434
+```
 
-诚挚邀请志同道合的朋友们为本仓库贡献更多内容！若您希望贡献代码：
-1. **Fork** 本仓库
-2. 在本地拉取您 Fork 的仓库
-3. **本地创建新的分支**并进行修改
-4. 将修改后的项目**推送**到您 Fork 的仓库中
-5. **Pull Request** 至本仓库等待合并
+The TUI uses the HTTP API. Enter selects or switches a model, text followed by Enter sends a message, Ctrl-S stops the model, Ctrl-R refreshes the model list, and Ctrl-C exits.
 
-## 代码贡献人员
+## HTTP API
 
-<a href="https://github.com/LulietLyan/README-Template/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=LulietLyan/README-Template" alt="contrib.rocks image" />
-</a>
+All custom routes use the `/api/v1` prefix:
 
-<p align="right">(<a href="#readme-top">返回顶部</a>)</p>
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/health` | Check that the API responds |
+| `GET` | `/api/v1/models` | List the model catalog |
+| `POST` | `/api/v1/models/refresh` | Rescan the model directory |
+| `GET` | `/api/v1/status` | Read lifecycle and request status |
+| `POST` | `/api/v1/chat` | Chat with a SQLite-backed conversation; supports SSE |
+| `POST` | `/api/v1/conversations` | Create a conversation |
+| `GET` | `/api/v1/conversations` | List conversations |
+| `GET` | `/api/v1/conversations/:id` | Read a conversation and its messages |
+| `DELETE` | `/api/v1/conversations/:id` | Delete a conversation |
+| `POST` | `/api/v1/service/stop` | Stop the loaded model |
+| `POST` | `/api/v1/service/switch` | Stop the current model and load another |
 
-# ❓ 联系作者
+The chat request identifies the model by name and sends a `conversation_id` plus one message. Streaming responses use `token`, `error`, and `done` SSE events.
 
-- **项目维护者**：您的姓名  
-- **社交媒体**：[@您的推特](https://twitter.com/your_username)  
-- **电子邮箱**：email@example.com
-- **项目地址**：[GitHub仓库](https://github.com/your_username/repo_name)  
+## Hugging Face Import
 
-<p align="right">(<a href="#readme-top">返回顶部</a>)</p>
+`import-hf` accepts either a fixed Hugging Face revision or an existing local HF weight directory. It writes the download cache and conversion intermediates to `--work-dir`, then publishes a new model directory under `--models-dir`. The source weights are not overwritten.
 
-# ❗ 授权说明
+```bash
+source ~/.bashrc
+conda activate mini-ollama-hf
+/tmp/mini-ollama import-hf MODEL_NAME \
+  --repo OWNER/REPO \
+  --revision 40-character-commit-sha \
+  --models-dir /path/to/models \
+  --work-dir /path/to/external/cache \
+  --python "$(command -v python)" \
+  --quantizer build/llama-server/bin/llama-quantize
+```
 
-本项目采用 MIT LICENSE 开源协议（公有领域授权），完整授权条款请参见项目根目录下的 `LICENSE.txt` 文件。
+For existing local HF weights, replace `--repo` and `--revision` with `--source-dir /path/to/hf-weights`.
 
-<p align="right">(<a href="#readme-top">返回顶部</a>)</p>
+The downloader uses the configured proxy and defaults to the Hugging Face mirror used by the project scripts. A private repository receives only a token file path through `--token-file`; token contents are not printed or stored in manifests.
 
-<img src="./image/line-neon.gif" width=100%><br>
+## Tests
+
+Run the automated checks from the repository root:
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+python -m unittest discover -s scripts -p 'test_hf_snapshot.py' -v
+```
+
+The primary end-to-end target is Linux with CUDA, using at least one 1B and one 8B GGUF model. macOS support remains a later validation target.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
