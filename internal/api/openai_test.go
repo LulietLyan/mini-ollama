@@ -57,6 +57,30 @@ func newOpenAITestHTTP(t *testing.T, backend http.Handler, lifecycle modelservic
 	return httptest.NewServer(server.Handler())
 }
 
+func TestMetricsProxy(t *testing.T) {
+	backend := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/metrics" {
+			t.Fatalf("backend path = %s", request.URL.Path)
+		}
+		writer.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = io.WriteString(writer, "llama_server_requests_total 1\n")
+	})
+	server := newOpenAITestHTTP(t, backend, modelservice.LifecycleReady)
+	defer server.Close()
+	response, err := http.Get(server.URL + "/api/v1/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(data), "llama_server_requests_total 1") {
+		t.Fatalf("status = %d body = %s", response.StatusCode, data)
+	}
+}
+
 func TestOpenAIModels(t *testing.T) {
 	server := newOpenAITestHTTP(
 		t,
@@ -105,6 +129,10 @@ func TestOpenAIChatCompletion(t *testing.T) {
 				Role    string `json:"role"`
 				Content string `json:"content"`
 			} `json:"messages"`
+			TopP             float64 `json:"top_p"`
+			PresencePenalty  float64 `json:"presence_penalty"`
+			FrequencyPenalty float64 `json:"frequency_penalty"`
+			Seed             int     `json:"seed"`
 		}
 
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
@@ -113,14 +141,18 @@ func TestOpenAIChatCompletion(t *testing.T) {
 
 		if len(payload.Messages) != 2 ||
 			payload.Messages[0].Role != "system" ||
-			payload.Messages[1].Content != "hello" {
+			payload.Messages[1].Content != "hello" ||
+			payload.TopP != 0.8 ||
+			payload.PresencePenalty != 0.2 ||
+			payload.FrequencyPenalty != -0.1 ||
+			payload.Seed != 7 {
 			t.Fatalf("messages = %#v", payload.Messages)
 		}
 
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(
 			writer,
-			`{"choices":[{"message":{"role":"assistant","content":"world"}}]}`,
+			`{"choices":[{"message":{"role":"assistant","content":"world"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`,
 		)
 	})
 
@@ -128,7 +160,7 @@ func TestOpenAIChatCompletion(t *testing.T) {
 	defer server.Close()
 
 	requestBody := strings.NewReader(
-		`{"model":"demo","messages":[{"role":"developer","content":"be concise"},{"role":"user","content":"hello"}]}`,
+		`{"model":"demo","messages":[{"role":"developer","content":"be concise"},{"role":"user","content":"hello"}],"top_p":0.8,"presence_penalty":0.2,"frequency_penalty":-0.1,"seed":7}`,
 	)
 
 	request, err := http.NewRequestWithContext(
@@ -160,7 +192,9 @@ func TestOpenAIChatCompletion(t *testing.T) {
 
 	if body.Object != "chat.completion" ||
 		body.Model != "demo" ||
-		body.Choices[0].Message.Content != "world" {
+		body.Choices[0].Message.Content != "world" ||
+		body.Usage == nil ||
+		body.Usage.TotalTokens != 5 {
 		t.Fatalf("body = %#v", body)
 	}
 }
@@ -174,6 +208,7 @@ func TestOpenAIStreamingCompletion(t *testing.T) {
 		_, _ = io.WriteString(
 			writer,
 			"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"+
+				"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n"+
 				"data: [DONE]\n\n",
 		)
 	})
@@ -182,7 +217,7 @@ func TestOpenAIStreamingCompletion(t *testing.T) {
 	defer server.Close()
 
 	requestBody := strings.NewReader(
-		`{"model":"demo","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+		`{"model":"demo","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true}}`,
 	)
 
 	request, err := http.NewRequest(
@@ -211,8 +246,28 @@ func TestOpenAIStreamingCompletion(t *testing.T) {
 		!strings.Contains(body, `"chat.completion.chunk"`) ||
 		!strings.Contains(body, `"content":"hello"`) ||
 		!strings.Contains(body, `"finish_reason":"stop"`) ||
+		!strings.Contains(body, `"total_tokens":3`) ||
 		!strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
 		t.Fatalf("status = %d body = %s", response.StatusCode, body)
+	}
+}
+
+func TestOpenAIRejectsStreamUsageWithoutStream(t *testing.T) {
+	server := newOpenAITestHTTP(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), modelservice.LifecycleReady)
+	defer server.Close()
+	requestBody := strings.NewReader(`{"model":"demo","messages":[{"role":"user","content":"hello"}],"stream_options":{"include_usage":true}}`)
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d", response.StatusCode)
 	}
 }
 
