@@ -29,11 +29,13 @@ type Model struct {
 }
 
 type Status struct {
-	Lifecycle    string  `json:"lifecycle"`
-	Model        string  `json:"model"`
-	Error        string  `json:"error"`
-	StartedAt    *string `json:"started_at"`
-	RequestCount uint64  `json:"request_count"`
+	Lifecycle      string  `json:"lifecycle"`
+	Model          string  `json:"model"`
+	Error          string  `json:"error"`
+	StartedAt      *string `json:"started_at"`
+	ReadyAt        *string `json:"ready_at"`
+	LoadDurationMs int64   `json:"load_duration_ms"`
+	RequestCount   uint64  `json:"request_count"`
 }
 
 func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
