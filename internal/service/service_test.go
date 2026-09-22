@@ -49,6 +49,8 @@ func TestBuildServerArgs(t *testing.T) {
 		Config{
 			ContextSize: 4096,
 			GPULayers:   "all",
+			SplitMode:   "layer",
+			TensorSplit: "3,1",
 		},
 	)
 
@@ -63,6 +65,11 @@ func TestBuildServerArgs(t *testing.T) {
 		"4096",
 		"--gpu-layers",
 		"all",
+		"--split-mode",
+		"layer",
+		"--tensor-split",
+		"3,1",
+		"--metrics",
 	}
 
 	if len(got) != len(want) {
@@ -81,14 +88,14 @@ func TestBuildServerArgs(t *testing.T) {
 	}
 }
 
-func TestValidateConfigRejectsMultipleDevices(t *testing.T) {
-	err := validateConfig(Config{
-		ServerPath: "/bin/true",
-		ModelPath:  "/models/model.gguf",
-		Device:     "0,1",
-	})
+func TestValidateDeviceListAcceptsMultipleDevices(t *testing.T) {
+	if err := validateDeviceList("0,1"); err != nil {
+		t.Fatalf("unexpected multi-device validation error: %v", err)
+	}
+}
 
-	if err == nil {
-		t.Fatal("expected multiple-device validation error")
+func TestValidateDeviceListRejectsDuplicateDevices(t *testing.T) {
+	if err := validateDeviceList("0,0"); err == nil {
+		t.Fatal("expected duplicate-device validation error")
 	}
 }
