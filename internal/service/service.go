@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"mini-ollama/internal/gpu"
 	"mini-ollama/internal/runner"
 )
 
@@ -28,24 +29,37 @@ const (
 )
 
 type Config struct {
-	ServerPath  string
-	ModelPath   string
-	Device      string
-	ContextSize int
-	GPULayers   string
-	Host        string
-	ModelName   string
-	Port        int
-	Stdout      io.Writer
-	Stderr      io.Writer
+	ServerPath        string
+	ModelPath         string
+	Device            string
+	ContextSize       int
+	GPULayers         string
+	SplitMode         string
+	TensorSplit       string
+	AutoGPU           bool
+	GPUMemoryFraction float64
+	GPUProbe          gpu.Probe
+	MemoryReserveMiB  int64
+	RequiredMemoryMiB int64
+	Host              string
+	ModelName         string
+	Port              int
+	Stdout            io.Writer
+	Stderr            io.Writer
 }
 
 type Status struct {
-	Lifecycle    Lifecycle
-	Model        string
-	Error        string
-	StartedAt    *time.Time
-	RequestCount uint64
+	Lifecycle         Lifecycle  `json:"lifecycle"`
+	Model             string     `json:"model"`
+	Error             string     `json:"error"`
+	StartedAt         *time.Time `json:"started_at,omitempty"`
+	ReadyAt           *time.Time `json:"ready_at,omitempty"`
+	LoadDurationMs    int64      `json:"load_duration_ms"`
+	RequestCount      uint64     `json:"request_count"`
+	Device            string     `json:"device"`
+	TensorSplit       string     `json:"tensor_split"`
+	RequiredMemoryMiB int64      `json:"required_memory_mib"`
+	AutoGPU           bool       `json:"auto_gpu"`
 }
 
 type serviceRun struct {
@@ -69,9 +83,11 @@ type Service struct {
 	model     string
 	err       string
 
-	startedAt    *time.Time
-	requestCount uint64
-	run          *serviceRun
+	startedAt      *time.Time
+	readyAt        *time.Time
+	loadDurationMs int64
+	requestCount   uint64
+	run            *serviceRun
 }
 
 func New(config Config) *Service {
@@ -124,6 +140,17 @@ func (s *Service) Start(ctx context.Context) error {
 		s.finish(run, err)
 		return err
 	}
+	config, err := resolveRuntimeConfig(ctx, config)
+	if err != nil {
+		cancel()
+		s.finish(run, err)
+		return err
+	}
+	s.mu.Lock()
+	if s.run == run {
+		s.config = config
+	}
+	s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		cancel()
 		s.finish(run, err)
@@ -202,6 +229,9 @@ func (s *Service) Start(ctx context.Context) error {
 		<-run.done
 		return context.Canceled
 	}
+	readyAt := time.Now()
+	s.readyAt = &readyAt
+	s.loadDurationMs = readyAt.Sub(now).Milliseconds()
 	s.lifecycle = LifecycleReady
 	s.mu.Unlock()
 
@@ -223,6 +253,8 @@ func (s *Service) Stop(ctx context.Context) error {
 		s.model = ""
 		s.err = ""
 		s.startedAt = nil
+		s.readyAt = nil
+		s.loadDurationMs = 0
 		s.run = nil
 		s.mu.Unlock()
 		return nil
@@ -236,6 +268,8 @@ func (s *Service) Stop(ctx context.Context) error {
 		s.model = ""
 		s.err = ""
 		s.startedAt = nil
+		s.readyAt = nil
+		s.loadDurationMs = 0
 		s.mu.Unlock()
 		return nil
 	}
@@ -292,15 +326,24 @@ func (s *Service) Status() Status {
 	defer s.mu.Unlock()
 
 	status := Status{
-		Lifecycle:    s.lifecycle,
-		Model:        s.model,
-		Error:        s.err,
-		RequestCount: s.requestCount,
+		Lifecycle:         s.lifecycle,
+		Model:             s.model,
+		Error:             s.err,
+		LoadDurationMs:    s.loadDurationMs,
+		RequestCount:      s.requestCount,
+		Device:            s.config.Device,
+		TensorSplit:       s.config.TensorSplit,
+		AutoGPU:           s.config.AutoGPU,
+		RequiredMemoryMiB: s.config.RequiredMemoryMiB,
 	}
 
 	if s.startedAt != nil {
 		startedAt := *s.startedAt
 		status.StartedAt = &startedAt
+	}
+	if s.readyAt != nil {
+		readyAt := *s.readyAt
+		status.ReadyAt = &readyAt
 	}
 
 	return status
@@ -341,6 +384,8 @@ func (s *Service) finish(run *serviceRun, processErr error) {
 				s.model = ""
 				s.err = ""
 				s.startedAt = nil
+				s.readyAt = nil
+				s.loadDurationMs = 0
 				run.terminalErr = nil
 			} else {
 				s.lifecycle = LifecycleError
@@ -400,14 +445,128 @@ func validateConfig(config Config) error {
 		return errors.New("port must be between 0 and 65535")
 	}
 
-	if strings.Contains(strings.TrimSpace(config.Device), ",") {
-		return fmt.Errorf(
-			"device must select one CUDA device: %q",
-			config.Device,
-		)
+	if strings.EqualFold(strings.TrimSpace(config.Device), "auto") && !config.AutoGPU {
+		return errors.New("device=auto requires auto GPU allocation")
+	}
+	if !strings.EqualFold(strings.TrimSpace(config.Device), "auto") {
+		if err := validateDeviceList(config.Device); err != nil {
+			return err
+		}
+	}
+	if err := validateSplitMode(config.SplitMode); err != nil {
+		return err
+	}
+	if err := validateTensorSplit(config.TensorSplit); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func validateDeviceList(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		device, err := strconv.Atoi(item)
+		if err != nil || device < 0 {
+			return fmt.Errorf("device must be a comma-separated list of non-negative CUDA indexes: %q", value)
+		}
+		if _, exists := seen[device]; exists {
+			return fmt.Errorf("device contains duplicate CUDA index: %d", device)
+		}
+		seen[device] = struct{}{}
+	}
+	return nil
+}
+
+func validateSplitMode(value string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil
+	}
+	switch value {
+	case "none", "layer", "row", "tensor":
+		return nil
+	default:
+		return fmt.Errorf("split mode must be none, layer, row, or tensor: %q", value)
+	}
+}
+
+func validateTensorSplit(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	positive := false
+	for _, item := range strings.Split(value, ",") {
+		ratio, err := strconv.ParseFloat(strings.TrimSpace(item), 64)
+		if err != nil || ratio < 0 {
+			return fmt.Errorf("tensor split must be comma-separated non-negative numbers: %q", value)
+		}
+		if ratio > 0 {
+			positive = true
+		}
+	}
+	if !positive {
+		return fmt.Errorf("tensor split must contain at least one positive value")
+	}
+	return nil
+}
+
+func resolveRuntimeConfig(ctx context.Context, config Config) (Config, error) {
+	if !config.AutoGPU {
+		return config, nil
+	}
+	probe := config.GPUProbe
+	if probe == nil {
+		probe = gpu.NVIDIAProbe{}
+	}
+	devices, err := probe.List(ctx)
+	if err != nil {
+		return config, err
+	}
+	modelInfo, err := os.Stat(config.ModelPath)
+	if err != nil {
+		return config, fmt.Errorf("stat model for GPU allocation: %w", err)
+	}
+	requiredMiB, err := gpu.RequiredMemoryMiB(modelInfo.Size(), config.ContextSize, config.MemoryReserveMiB, config.GPUMemoryFraction)
+	if err != nil {
+		return config, err
+	}
+
+	requested := make([]int, 0)
+	deviceValue := strings.TrimSpace(config.Device)
+	if deviceValue != "" && !strings.EqualFold(deviceValue, "auto") {
+		for _, value := range strings.Split(deviceValue, ",") {
+			index, parseErr := strconv.Atoi(strings.TrimSpace(value))
+			if parseErr != nil {
+				return config, fmt.Errorf("parse requested GPU: %w", parseErr)
+			}
+			requested = append(requested, index)
+		}
+	}
+	allocation, err := gpu.Allocate(devices, requested, requiredMiB)
+	if err != nil {
+		return config, err
+	}
+	config.Device = allocation.DeviceList
+	config.RequiredMemoryMiB = allocation.RequiredMiB
+	if strings.TrimSpace(config.GPULayers) == "" {
+		config.GPULayers = "all"
+	}
+	if len(allocation.Devices) > 1 {
+		if strings.TrimSpace(config.SplitMode) == "" {
+			config.SplitMode = "layer"
+		}
+		if strings.TrimSpace(config.TensorSplit) == "" {
+			config.TensorSplit = allocation.TensorSplit
+		}
+	}
+	return config, nil
 }
 
 func buildServerArgs(
@@ -440,6 +599,16 @@ func buildServerArgs(
 			layers,
 		)
 	}
+
+	if splitMode := strings.TrimSpace(config.SplitMode); splitMode != "" {
+		args = append(args, "--split-mode", splitMode)
+	}
+	if tensorSplit := strings.TrimSpace(config.TensorSplit); tensorSplit != "" {
+		args = append(args, "--tensor-split", tensorSplit)
+	}
+
+	// llama-server exposes Prometheus-compatible timings at /metrics.
+	args = append(args, "--metrics")
 
 	return args
 }
