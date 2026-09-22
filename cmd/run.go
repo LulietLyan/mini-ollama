@@ -12,17 +12,23 @@ import (
 	"syscall"
 	"time"
 
+	"mini-ollama/internal/gpu"
 	"mini-ollama/internal/runner"
 
 	"github.com/spf13/cobra"
 )
 
 type runOptions struct {
-	contextSize int
-	gpuLayers   string
-	device      string
-	host        string
-	port        int
+	contextSize       int
+	gpuLayers         string
+	device            string
+	splitMode         string
+	tensorSplit       string
+	autoGPU           bool
+	gpuMemoryFraction float64
+	memoryReserveMiB  int64
+	host              string
+	port              int
 }
 
 func newRunCommand() *cobra.Command {
@@ -58,7 +64,42 @@ func newRunCommand() *cobra.Command {
 		&options.device,
 		"device",
 		"",
-		"CUDA device visible to llama-server, for example 0",
+		"CUDA device indexes visible to llama-server, for example 0 or 0,1",
+	)
+
+	flags.StringVar(
+		&options.splitMode,
+		"split-mode",
+		"",
+		"multi-GPU split mode: none, layer, row, or tensor",
+	)
+
+	flags.StringVar(
+		&options.tensorSplit,
+		"tensor-split",
+		"",
+		"multi-GPU tensor proportions, for example 3,1",
+	)
+
+	flags.BoolVar(
+		&options.autoGPU,
+		"auto-gpu",
+		false,
+		"allocate GPUs from free NVIDIA memory",
+	)
+
+	flags.Float64Var(
+		&options.gpuMemoryFraction,
+		"gpu-memory-fraction",
+		0.90,
+		"maximum fraction of each GPU memory used by auto allocation",
+	)
+
+	flags.Int64Var(
+		&options.memoryReserveMiB,
+		"memory-reserve-mib",
+		512,
+		"reserved GPU memory for runtime overhead",
 	)
 
 	flags.StringVar(
@@ -90,6 +131,12 @@ func runModel(
 
 	if err := validateRunOptions(options); err != nil {
 		return err
+	}
+	if options.autoGPU {
+		options, err = resolveRunGPU(modelPath, options)
+		if err != nil {
+			return err
+		}
 	}
 
 	if cmd.Name() == "serve" && options.port == 0 {
@@ -211,16 +258,67 @@ func validateRunOptions(options runOptions) error {
 	if err := validateGPULayers(options.gpuLayers); err != nil {
 		return err
 	}
+	if !options.autoGPU && !strings.EqualFold(strings.TrimSpace(options.device), "auto") {
+		if err := validateDeviceList(options.device); err != nil {
+			return err
+		}
+	}
+	if options.autoGPU && options.gpuMemoryFraction > 1 {
+		return fmt.Errorf("GPU memory fraction must be between 0 and 1")
+	}
+	if err := validateSplitMode(options.splitMode); err != nil {
+		return err
+	}
+	return validateTensorSplit(options.tensorSplit)
+}
 
-	device := strings.TrimSpace(options.device)
-	if strings.Contains(device, ",") {
-		return fmt.Errorf(
-			"device must select one CUDA device: %q",
-			device,
-		)
+func resolveRunGPU(modelPath string, options runOptions) (runOptions, error) {
+	info, err := os.Stat(modelPath)
+	if err != nil {
+		return options, fmt.Errorf("stat model for GPU allocation: %w", err)
 	}
 
-	return nil
+	devices, err := (gpu.NVIDIAProbe{}).List(context.Background())
+	if err != nil {
+		return options, err
+	}
+
+	required, err := gpu.RequiredMemoryMiB(info.Size(), options.contextSize, options.memoryReserveMiB, options.gpuMemoryFraction)
+	if err != nil {
+		return options, err
+	}
+
+	requested := make([]int, 0)
+	if value := strings.TrimSpace(options.device); value != "" && !strings.EqualFold(value, "auto") {
+		for _, item := range strings.Split(value, ",") {
+			index, parseErr := strconv.Atoi(strings.TrimSpace(item))
+			if parseErr != nil {
+				return options, fmt.Errorf("parse requested GPU: %w", parseErr)
+			}
+			requested = append(requested, index)
+		}
+	}
+
+	allocation, err := gpu.Allocate(devices, requested, required)
+	if err != nil {
+		return options, err
+	}
+
+	options.device = allocation.DeviceList
+	if strings.TrimSpace(options.gpuLayers) == "" {
+		options.gpuLayers = "all"
+	}
+
+	if len(allocation.Devices) > 1 {
+		if options.splitMode == "" {
+			options.splitMode = "layer"
+		}
+		if options.tensorSplit == "" {
+			options.tensorSplit = allocation.TensorSplit
+		}
+	}
+
+	return options, nil
 }
 
 func validateGPULayers(value string) error {
@@ -271,6 +369,14 @@ func buildServerArgs(
 		)
 	}
 
+	if splitMode := strings.TrimSpace(options.splitMode); splitMode != "" {
+		args = append(args, "--split-mode", splitMode)
+	}
+	if tensorSplit := strings.TrimSpace(options.tensorSplit); tensorSplit != "" {
+		args = append(args, "--tensor-split", tensorSplit)
+	}
+	args = append(args, "--metrics")
+
 	if options.host != "" {
 		args = append(
 			args,
@@ -288,6 +394,57 @@ func buildServerArgs(
 	}
 
 	return args
+}
+
+func validateDeviceList(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	for _, item := range strings.Split(value, ",") {
+		device, err := strconv.Atoi(strings.TrimSpace(item))
+		if err != nil || device < 0 {
+			return fmt.Errorf("device must be a comma-separated list of non-negative CUDA indexes: %q", value)
+		}
+		if _, ok := seen[device]; ok {
+			return fmt.Errorf("device contains duplicate CUDA index: %d", device)
+		}
+		seen[device] = struct{}{}
+	}
+	return nil
+}
+
+func validateSplitMode(value string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil
+	}
+	switch value {
+	case "none", "layer", "row", "tensor":
+		return nil
+	default:
+		return fmt.Errorf("split mode must be none, layer, row, or tensor: %q", value)
+	}
+}
+
+func validateTensorSplit(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	positive := false
+	for _, item := range strings.Split(value, ",") {
+		ratio, err := strconv.ParseFloat(strings.TrimSpace(item), 64)
+		if err != nil || ratio < 0 {
+			return fmt.Errorf("tensor split must be comma-separated non-negative numbers: %q", value)
+		}
+		positive = positive || ratio > 0
+	}
+	if !positive {
+		return fmt.Errorf("tensor split must contain at least one positive value")
+	}
+	return nil
 }
 
 func buildHealthURL(options runOptions) (string, error) {
