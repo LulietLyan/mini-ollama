@@ -7,7 +7,6 @@
     <summary><h1 style="display: inline-block"><b>🌠 mini-ollama</b></h1></summary>
     <p>基于 Go 与 llama.cpp 的本地 GGUF 模型命令行工具</p>
     <p><i>A local GGUF model CLI powered by Go and llama.cpp</i></p>
-    <a href="./docs/stage_5.md"><strong>查看开发文档 »</strong></a>
     <br />
     <a href="#-快速开始">快速开始</a>
     &middot;
@@ -68,7 +67,7 @@ Linux + CUDA 是当前主要验收环境。服务模式一次只加载一个模�
 - 提供 CLI 多轮聊天和 SSE 流式输出。
 - 使用 SQLite 保存 conversation 和 message。
 - 提供模型选择、停止、刷新和聊天 TUI。
-- 提供 health、models、status、chat、conversations 和 service control API。
+- 提供 health、models、status、chat、conversations、service control 和 OpenAI 风格 `/v1` API。
 - 从固定 Hugging Face commit 下载并校验权重。
 - 调用 llama.cpp 转换脚本和 `llama-quantize` 生成 Q4_K_M GGUF。
 - 支持已有本地 HF 权重的离线转换，不覆盖原始权重。
@@ -255,7 +254,15 @@ TUI 按键：
 | `POST` | `/api/v1/service/stop` | 停止当前模型 |
 | `POST` | `/api/v1/service/switch` | 显式切换模型 |
 
-流式聊天使用 `token`、`error` 和 `done` SSE 事件。当前对外接口是 mini-ollama 自定义 API，不提供 OpenAI 兼容接口。
+OpenAI 风格接口：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `GET` | `/v1/models` | 返回本地模型列表 |
+| `GET` | `/v1/models/:model` | 返回单个模型信息 |
+| `POST` | `/v1/chat/completions` | 非流式或 SSE 流式文本聊天 |
+
+自定义 API 流式聊天使用 `token`、`error` 和 `done` 事件；OpenAI 风格接口使用 `chat.completion.chunk` 和 `data: [DONE]`。两套接口都只监听本机，模型生命周期仍由 `serve` 管理。
 
 <p align="right">(<a href="#readme-top">返回顶部</a>)</p>
 
@@ -300,7 +307,7 @@ go vet ./...
 python -m unittest discover -s scripts -p 'test_hf_snapshot.py' -v
 ```
 
-当前自动化测试覆盖参数校验、模型目录、HTTP/SSE 客户端、SQLite、模型控制、进程就绪检查、HF 导入和 TUI 状态。Linux + CUDA 的最终验收需要分别使用至少一个 1B 和一个 8B GGUF。
+当前自动化测试覆盖参数校验、模型目录、HTTP/SSE 客户端、OpenAI 风格模型和聊天接口、SQLite、模型控制、进程就绪检查、HF 导入和 TUI 状态。Linux + CUDA 的最终验收需要分别使用至少一个 1B 和一个 8B GGUF。
 
 <p align="right">(<a href="#readme-top">返回顶部</a>)</p>
 
@@ -310,7 +317,7 @@ python -m unittest discover -s scripts -p 'test_hf_snapshot.py' -v
 - 当前默认单卡 CUDA，不实现自动显存分配。
 - 不实现多模型并行和多卡调度。
 - HTTP API 默认只监听本机，不提供远程认证。
-- 不提供 Web UI、桌面 UI 或 OpenAI 兼容 API。
+- 不提供 Web UI 或桌面 UI。OpenAI 风格接口仅覆盖本阶段列出的本地文本聊天子集。
 - Linux + CUDA 是当前主要验收目标，macOS 仍需继续验证。
 
 <p align="right">(<a href="#readme-top">返回顶部</a>)</p>
