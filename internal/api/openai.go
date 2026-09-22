@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"mini-ollama/internal/llama"
-	modelservice "mini-ollama/internal/service"
 	"net/http"
 	"os"
 	"strings"
@@ -34,6 +33,7 @@ type openAIChatRequest struct {
 	TopP                *float64          `json:"top_p,omitempty"`
 	PresencePenalty     *float64          `json:"presence_penalty,omitempty"`
 	FrequencyPenalty    *float64          `json:"frequency_penalty,omitempty"`
+	Seed                *int              `json:"seed,omitempty"`
 	ResponseFormat      json.RawMessage   `json:"response_format,omitempty"`
 	Tools               json.RawMessage   `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage   `json:"tool_choice,omitempty"`
@@ -191,13 +191,20 @@ func (s *Server) openAIChat(c *gin.Context) {
 		return
 	}
 
-	if request.StreamOptions != nil && request.StreamOptions.IncludeUsage {
-		openAIError(c, http.StatusBadRequest, "stream_options.include_usage is not supported", "invalid_request_error", "stream_options.include_usage", "unsupported_parameter")
+	if request.StreamOptions != nil && request.StreamOptions.IncludeUsage && !request.Stream {
+		openAIError(c, http.StatusBadRequest, "stream_options.include_usage requires stream=true", "invalid_request_error", "stream_options.include_usage", "invalid_value")
 		return
 	}
-
-	if request.TopP != nil || request.PresencePenalty != nil || request.FrequencyPenalty != nil {
-		openAIError(c, http.StatusBadRequest, "top_p and presence/frequency penalties are not supported", "invalid_request_error", "sampling", "unsupported_parameter")
+	if request.TopP != nil && (*request.TopP < 0 || *request.TopP > 1) {
+		openAIError(c, http.StatusBadRequest, "top_p must be between 0 and 1", "invalid_request_error", "top_p", "invalid_value")
+		return
+	}
+	if request.PresencePenalty != nil && (*request.PresencePenalty < -2 || *request.PresencePenalty > 2) {
+		openAIError(c, http.StatusBadRequest, "presence_penalty must be between -2 and 2", "invalid_request_error", "presence_penalty", "invalid_value")
+		return
+	}
+	if request.FrequencyPenalty != nil && (*request.FrequencyPenalty < -2 || *request.FrequencyPenalty > 2) {
+		openAIError(c, http.StatusBadRequest, "frequency_penalty must be between -2 and 2", "invalid_request_error", "frequency_penalty", "invalid_value")
 		return
 	}
 
@@ -255,45 +262,44 @@ func (s *Server) openAIChat(c *gin.Context) {
 		return
 	}
 
-	entry, ok := s.catalog.Find(request.Model)
+	_, ok := s.catalog.Find(request.Model)
 	if !ok {
 		openAIError(c, http.StatusNotFound, "model not found", "invalid_request_error", "model", "model_not_found")
 		return
 	}
 
-	status := s.status()
-	if status.Lifecycle != modelservice.LifecycleReady {
-		openAIError(c, http.StatusServiceUnavailable, "model service is not ready", "server_error", "model", "service_unavailable")
-		return
-	}
-
-	if status.Model != entry.Name {
-		openAIError(c, http.StatusConflict, "requested model is not loaded", "invalid_request_error", "model", "model_not_loaded")
-		return
-	}
-
-	backendURL, err := s.backendURL()
+	backendURL, releaseBackend, err := s.acquire(request.Model, c.Request.Context())
 	if err != nil {
 		openAIError(c, http.StatusServiceUnavailable, err.Error(), "server_error", "model", "service_unavailable")
 		return
 	}
+	defer releaseBackend()
 
 	s.requests.Add(1)
+	var streamOptions *llama.StreamOptions
+	if request.StreamOptions != nil && request.StreamOptions.IncludeUsage {
+		streamOptions = &llama.StreamOptions{IncludeUsage: true}
+	}
 
 	upstream := llama.ChatRequest{
-		Model:       request.Model,
-		Messages:    messages,
-		Stream:      request.Stream,
-		MaxTokens:   maxTokens,
-		Temperature: request.Temperature,
-		Stop:        stop,
+		Model:            request.Model,
+		Messages:         messages,
+		Stream:           request.Stream,
+		StreamOptions:    streamOptions,
+		MaxTokens:        maxTokens,
+		Temperature:      request.Temperature,
+		TopP:             request.TopP,
+		PresencePenalty:  request.PresencePenalty,
+		FrequencyPenalty: request.FrequencyPenalty,
+		Seed:             request.Seed,
+		Stop:             stop,
 	}
 
 	completionID := newCompletionID()
 	created := time.Now().Unix()
 
 	if !request.Stream {
-		response, err := s.llama.Chat(c.Request.Context(), backendURL, upstream, nil)
+		result, err := s.llama.ChatResult(c.Request.Context(), backendURL, upstream, nil)
 		if err != nil {
 			openAIError(c, http.StatusBadGateway, err.Error(), "upstream_error", "", "backend_error")
 			return
@@ -308,10 +314,11 @@ func (s *Server) openAIChat(c *gin.Context) {
 				Index: 0,
 				Message: openAIResponseMessage{
 					Role:    "assistant",
-					Content: response,
+					Content: result.Content,
 				},
 				FinishReason: "stop",
 			}},
+			Usage: convertUsage(result.Usage),
 		})
 		return
 	}
@@ -331,11 +338,12 @@ func (s *Server) openAIChat(c *gin.Context) {
 			Index: 0,
 			Delta: openAIDelta{Role: "assistant"},
 		},
+		nil,
 	); err != nil {
 		return
 	}
 
-	_, err = s.llama.Chat(c.Request.Context(), backendURL, upstream, func(delta string) error {
+	result, err := s.llama.ChatResult(c.Request.Context(), backendURL, upstream, func(delta string) error {
 		return writeOpenAIChunk(
 			c,
 			completionID,
@@ -345,6 +353,7 @@ func (s *Server) openAIChat(c *gin.Context) {
 				Index: 0,
 				Delta: openAIDelta{Content: delta},
 			},
+			nil,
 		)
 	})
 	if err != nil {
@@ -362,6 +371,7 @@ func (s *Server) openAIChat(c *gin.Context) {
 			Index:        0,
 			FinishReason: &finishReason,
 		},
+		convertUsage(result.Usage),
 	); err != nil {
 		return
 	}
@@ -441,13 +451,14 @@ func openAIStop(raw json.RawMessage) ([]string, error) {
 	return values, nil
 }
 
-func writeOpenAIChunk(c *gin.Context, id, model string, created int64, choice openAIChunkChoice) error {
+func writeOpenAIChunk(c *gin.Context, id, model string, created int64, choice openAIChunkChoice, usage *openAIUsage) error {
 	payload, err := json.Marshal(openAIChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: created,
 		Model:   model,
 		Choices: []openAIChunkChoice{choice},
+		Usage:   usage,
 	})
 	if err != nil {
 		return err
@@ -462,6 +473,17 @@ func writeOpenAIChunk(c *gin.Context, id, model string, created int64, choice op
 	}
 
 	return nil
+}
+
+func convertUsage(usage *llama.Usage) *openAIUsage {
+	if usage == nil {
+		return nil
+	}
+	return &openAIUsage{
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+	}
 }
 
 func writeOpenAIStreamError(c *gin.Context, message string) error {
