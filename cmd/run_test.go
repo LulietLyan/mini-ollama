@@ -188,6 +188,7 @@ func TestBuildServerArgs(t *testing.T) {
 		"4096",
 		"--gpu-layers",
 		"all",
+		"--metrics",
 		"--host",
 		"127.0.0.1",
 		"--port",
@@ -208,6 +209,7 @@ func TestBuildServerArgsWithDefaults(t *testing.T) {
 	want := []string{
 		"-m",
 		"/models/test.gguf",
+		"--metrics",
 	}
 
 	if !reflect.DeepEqual(got, want) {
@@ -266,12 +268,16 @@ func TestBuildHealthURLRejectsUnixSocket(t *testing.T) {
 	}
 }
 
-func TestValidateRunOptionsRejectsMultipleDevices(t *testing.T) {
-	err := validateRunOptions(runOptions{
-		device: "0,1",
-	})
+func TestValidateRunOptionsAcceptsMultipleDevices(t *testing.T) {
+	if err := validateRunOptions(runOptions{device: "0,1", splitMode: "layer", tensorSplit: "3,1"}); err != nil {
+		t.Fatalf("unexpected multi-GPU validation error: %v", err)
+	}
+}
+
+func TestValidateRunOptionsRejectsDuplicateDevices(t *testing.T) {
+	err := validateRunOptions(runOptions{device: "0,0"})
 	if err == nil {
-		t.Fatal("expected multiple-device validation error")
+		t.Fatal("expected duplicate-device validation error")
 	}
 }
 
