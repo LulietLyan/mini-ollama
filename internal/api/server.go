@@ -116,6 +116,11 @@ func (s *Server) Handler() http.Handler {
 	group.POST("/service/stop", s.stopService)
 	group.POST("/service/switch", s.switchService)
 
+	openAI := router.Group("/v1")
+	openAI.GET("/models", s.openAIModels)
+	openAI.GET("/models/:model", s.openAIModel)
+	openAI.POST("/chat/completions", s.openAIChat)
+
 	return router
 }
 
