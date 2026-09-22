@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -38,22 +40,26 @@ type Controller interface {
 }
 
 type Config struct {
-	Control    Controller
-	Catalog    *catalog.Catalog
-	History    *history.Store
-	BackendURL func() (string, error)
-	Status     func() modelservice.Status
+	Control        Controller
+	Catalog        *catalog.Catalog
+	History        *history.Store
+	BackendURL     func() (string, error)
+	AcquireBackend func(context.Context, string) (string, func(), error)
+	Status         func() modelservice.Status
+	Statuses       func() map[string]modelservice.Status
 }
 
 type Server struct {
-	control    Controller
-	catalog    *catalog.Catalog
-	history    *history.Store
-	backendURL func() (string, error)
-	status     func() modelservice.Status
-	llama      llama.Client
-	requests   atomic.Uint64
-	locks      *conversationLocks
+	control        Controller
+	catalog        *catalog.Catalog
+	history        *history.Store
+	backendURL     func() (string, error)
+	acquireBackend func(context.Context, string) (string, func(), error)
+	status         func() modelservice.Status
+	statuses       func() map[string]modelservice.Status
+	llama          llama.Client
+	requests       atomic.Uint64
+	locks          *conversationLocks
 }
 
 func newConversationLocks() *conversationLocks {
@@ -84,12 +90,14 @@ func (locks *conversationLocks) acquire(id string) func() {
 
 func New(config Config) *Server {
 	return &Server{
-		control:    config.Control,
-		catalog:    config.Catalog,
-		history:    config.History,
-		backendURL: config.BackendURL,
-		status:     config.Status,
-		locks:      newConversationLocks(),
+		control:        config.Control,
+		catalog:        config.Catalog,
+		history:        config.History,
+		backendURL:     config.BackendURL,
+		acquireBackend: config.AcquireBackend,
+		status:         config.Status,
+		statuses:       config.Statuses,
+		locks:          newConversationLocks(),
 	}
 }
 
@@ -105,6 +113,7 @@ func (s *Server) Handler() http.Handler {
 	group.POST("/models/refresh", s.refreshModels)
 
 	group.GET("/status", s.statusHandler)
+	group.GET("/metrics", s.metricsHandler)
 
 	group.POST("/chat", s.chat)
 
@@ -125,6 +134,54 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) health(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) }
+
+func (s *Server) metricsHandler(c *gin.Context) {
+	backendURL, err := s.backendURL()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	request, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, strings.TrimRight(backendURL, "/")+"/metrics", nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	contentType := response.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "text/plain; charset=utf-8"
+	}
+	c.Data(response.StatusCode, contentType, body)
+}
+
+func (s *Server) acquire(model string, ctx context.Context) (string, func(), error) {
+	if s.acquireBackend != nil {
+		return s.acquireBackend(ctx, model)
+	}
+	status := s.status()
+	if status.Lifecycle != modelservice.LifecycleReady {
+		return "", nil, fmt.Errorf("model service is not ready: %s", status.Lifecycle)
+	}
+	entry, ok := s.catalog.Find(model)
+	if !ok || status.Model != entry.Name {
+		return "", nil, fmt.Errorf("requested model is not loaded")
+	}
+	url, err := s.backendURL()
+	if err != nil {
+		return "", nil, err
+	}
+	return url, func() {}, nil
+}
 
 func (s *Server) models(c *gin.Context) {
 	result := make([]gin.H, 0)
@@ -148,23 +205,37 @@ func (s *Server) refreshModels(c *gin.Context) {
 
 func (s *Server) statusHandler(c *gin.Context) {
 	status := s.status()
-	c.JSON(http.StatusOK, gin.H{
-		"lifecycle":     status.Lifecycle,
-		"model":         status.Model,
-		"error":         status.Error,
-		"started_at":    status.StartedAt,
-		"request_count": s.requests.Load(),
-	})
+	value := gin.H{
+		"lifecycle":           status.Lifecycle,
+		"model":               status.Model,
+		"error":               status.Error,
+		"started_at":          status.StartedAt,
+		"ready_at":            status.ReadyAt,
+		"load_duration_ms":    status.LoadDurationMs,
+		"request_count":       s.requests.Load(),
+		"device":              status.Device,
+		"tensor_split":        status.TensorSplit,
+		"auto_gpu":            status.AutoGPU,
+		"required_memory_mib": status.RequiredMemoryMiB,
+	}
+	if s.statuses != nil {
+		value["loaded_models"] = s.statuses()
+	}
+	c.JSON(http.StatusOK, value)
 }
 
 type chatRequest struct {
-	Model          string   `json:"model"`
-	ConversationID string   `json:"conversation_id"`
-	Message        string   `json:"message"`
-	Stream         bool     `json:"stream"`
-	MaxTokens      int      `json:"max_tokens,omitempty"`
-	Temperature    *float64 `json:"temperature,omitempty"`
-	Stop           []string `json:"stop,omitempty"`
+	Model            string   `json:"model"`
+	ConversationID   string   `json:"conversation_id"`
+	Message          string   `json:"message"`
+	Stream           bool     `json:"stream"`
+	MaxTokens        int      `json:"max_tokens,omitempty"`
+	Temperature      *float64 `json:"temperature,omitempty"`
+	TopP             *float64 `json:"top_p,omitempty"`
+	PresencePenalty  *float64 `json:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+	Seed             *int     `json:"seed,omitempty"`
+	Stop             []string `json:"stop,omitempty"`
 }
 
 func (s *Server) chat(c *gin.Context) {
@@ -187,19 +258,9 @@ func (s *Server) chat(c *gin.Context) {
 		return
 	}
 
-	entry, ok := s.catalog.Find(request.Model)
+	_, ok := s.catalog.Find(request.Model)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
-		return
-	}
-
-	status := s.status()
-	if status.Lifecycle != modelservice.LifecycleReady {
-		c.JSON(http.StatusConflict, gin.H{"error": "model service is not ready", "lifecycle": status.Lifecycle})
-		return
-	}
-	if status.Model != entry.Name {
-		c.JSON(http.StatusConflict, gin.H{"error": "requested model is not loaded"})
 		return
 	}
 
@@ -226,11 +287,12 @@ func (s *Server) chat(c *gin.Context) {
 		return
 	}
 
-	backendURL, err := s.backendURL()
+	backendURL, releaseBackend, err := s.acquire(request.Model, c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
+	defer releaseBackend()
 
 	backendMessages := make([]llama.Message, 0, len(messages))
 	for _, message := range messages {
@@ -238,7 +300,18 @@ func (s *Server) chat(c *gin.Context) {
 	}
 
 	s.requests.Add(1)
-	upstream := llama.ChatRequest{Model: request.Model, Messages: backendMessages, Stream: request.Stream, MaxTokens: request.MaxTokens, Temperature: request.Temperature, Stop: request.Stop}
+	upstream := llama.ChatRequest{
+		Model:            request.Model,
+		Messages:         backendMessages,
+		Stream:           request.Stream,
+		MaxTokens:        request.MaxTokens,
+		Temperature:      request.Temperature,
+		TopP:             request.TopP,
+		PresencePenalty:  request.PresencePenalty,
+		FrequencyPenalty: request.FrequencyPenalty,
+		Seed:             request.Seed,
+		Stop:             request.Stop,
+	}
 
 	if !request.Stream {
 		response, err := s.llama.Chat(c.Request.Context(), backendURL, upstream, nil)
