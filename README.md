@@ -37,24 +37,27 @@
 
 # 📕 目录
 
+- [📕 目录](#-目录)
 - [🤔 项目简介](#-项目简介)
 - [✨ 已实现功能](#-已实现功能)
 - [🏗️ 系统架构](#️-系统架构)
 - [🔄 聊天流程](#-聊天流程)
 - [😋 快速开始](#-快速开始)
+  - [环境要求](#环境要求)
+  - [获取和构建 llama.cpp](#获取和构建-llamacpp)
+  - [启动服务](#启动服务)
 - [📂 模型目录](#-模型目录)
 - [🖥️ 命令行与 TUI](#️-命令行与-tui)
 - [🌐 HTTP API](#-http-api)
 - [🤗 Hugging Face 导入](#-hugging-face-导入)
 - [🧪 测试](#-测试)
-- [🗺️ 当前边界](#️-当前边界)
 - [❗ 授权说明](#-授权说明)
 
 # 🤔 项目简介
 
 **mini-ollama** 是一个学习型 Go 项目，通过 llama.cpp 的 `llama-server` 运行本地 GGUF 模型。项目提供 Cobra 命令行、Gin HTTP API、Bubble Tea 终端界面和 SQLite 聊天记录，不重新实现模型推理。
 
-Linux + CUDA 是当前主要验收环境。服务模式一次只加载一个模型，模型停止和切换必须由用户明确执行。`run MODEL` 也可以绕过服务 API，直接启动一个 llama-server 进程。
+Linux + CUDA 是当前主要验收环境。服务模式可以按配置驻留多个模型，并在聊天请求到达时自动加载和调度；`run MODEL` 仍然可以绕过服务 API，直接启动一个 llama-server 进程。
 
 <p align="right">(<a href="#readme-top">返回顶部</a>)</p>
 
@@ -63,11 +66,12 @@ Linux + CUDA 是当前主要验收环境。服务模式一次只加载一个模�
 - 扫描本地 GGUF 模型目录，并支持 `manifest.json` 元数据。
 - 校验模型大小和 SHA-256。
 - 启动、健康检查、停止和显式切换 llama-server。
-- 使用 `CUDA_VISIBLE_DEVICES` 选择单个 CUDA 设备。
+- 支持显式多 GPU 切分，以及基于 `nvidia-smi` 空闲显存的自动 GPU 分配。
+- 支持多个模型驻留、空闲模型 LRU 淘汰和请求期间的模型引用保护。
 - 提供 CLI 多轮聊天和 SSE 流式输出。
 - 使用 SQLite 保存 conversation 和 message。
 - 提供模型选择、停止、刷新和聊天 TUI。
-- 提供 health、models、status、chat、conversations、service control 和 OpenAI 风格 `/v1` API。
+- 提供 health、models、status、metrics、chat、conversations、service control 和 OpenAI 风格 `/v1` API。
 - 从固定 Hugging Face commit 下载并校验权重。
 - 调用 llama.cpp 转换脚本和 `llama-quantize` 生成 Q4_K_M GGUF。
 - 支持已有本地 HF 权重的离线转换，不覆盖原始权重。
@@ -86,8 +90,8 @@ flowchart LR
 
     API --> Catalog[模型目录 catalog]
     API --> History[SQLite 聊天记录]
-    API --> Controller[Controller]
-    Controller --> Service[Service 生命周期]
+    API --> Controller[Controller / LRU Scheduler]
+    Controller --> Service[多个 Service 生命周期]
     Service --> Runner[runner]
     Runner --> Llama[llama-server]
     API --> LlamaClient[llama HTTP client]
@@ -114,10 +118,11 @@ sequenceDiagram
     participant Llama as llama-server
 
     User->>Client: 选择模型
-    Client->>Mini: POST /api/v1/service/switch
-    Mini->>Llama: 启动 GGUF 模型
+    Client->>Mini: 发送模型名和聊天请求
+    Mini->>Mini: Acquire 模型并执行显存调度
+    Mini->>Llama: 启动或复用 GGUF 模型
     Llama-->>Mini: /health 返回成功
-    Mini-->>Client: lifecycle = ready
+    Mini-->>Client: 模型 ready
 
     Client->>Mini: 创建 conversation
     Mini->>DB: 保存 conversation
@@ -174,6 +179,20 @@ CUDA_VISIBLE_DEVICES=0 \
   --gpu-layers all
 ```
 
+自动显存分配和多模型调度：
+
+```bash
+/tmp/mini-ollama serve \
+  --models-dir /path/to/models \
+  --data-dir /tmp/mini-ollama-data \
+  --auto-gpu \
+  --gpu-memory-fraction 0.90 \
+  --memory-reserve-mib 512 \
+  --max-loaded-models 2
+```
+
+`--auto-gpu` 会读取 `nvidia-smi` 的空闲显存，按 GGUF 大小、上下文和保留空间估算需求，选择一张或多张 GPU，并生成 `CUDA_VISIBLE_DEVICES`、`--split-mode` 和 `--tensor-split`。模型请求会自动加载目标模型；达到 `--max-loaded-models` 后，只淘汰没有正在处理请求的最久未使用模型。
+
 默认 API 地址：`http://127.0.0.1:11434`。
 
 <p align="right">(<a href="#readme-top">返回顶部</a>)</p>
@@ -185,7 +204,7 @@ CUDA_VISIBLE_DEVICES=0 \
 ```text
 models/
 ├── Qwen3-8B-GGUF/
-│   ├── Qwen3-8B-GGUF.Q4_K_M.gguf
+│   ├── Qwen3-8B-Q4_K_M.gguf
 │   └── manifest.json
 └── Llama-3.2-1B-Instruct-Q4_K_M.gguf
 ```
@@ -245,7 +264,8 @@ TUI 按键：
 | `GET` | `/api/v1/health` | 检查 API 是否可响应 |
 | `GET` | `/api/v1/models` | 获取模型目录快照 |
 | `POST` | `/api/v1/models/refresh` | 重新扫描模型目录 |
-| `GET` | `/api/v1/status` | 获取生命周期、模型、错误和请求数 |
+| `GET` | `/api/v1/status` | 获取生命周期、加载耗时、显存分配和驻留模型 |
+| `GET` | `/api/v1/metrics` | 获取 llama-server Prometheus 指标 |
 | `POST` | `/api/v1/chat` | 非流式 JSON 或 SSE 流式聊天 |
 | `POST` | `/api/v1/conversations` | 创建 conversation |
 | `GET` | `/api/v1/conversations` | 列出 conversation |
@@ -262,7 +282,7 @@ OpenAI 风格接口：
 | `GET` | `/v1/models/:model` | 返回单个模型信息 |
 | `POST` | `/v1/chat/completions` | 非流式或 SSE 流式文本聊天 |
 
-自定义 API 流式聊天使用 `token`、`error` 和 `done` 事件；OpenAI 风格接口使用 `chat.completion.chunk` 和 `data: [DONE]`。两套接口都只监听本机，模型生命周期仍由 `serve` 管理。
+OpenAI 接口支持 `top_p`、`presence_penalty`、`frequency_penalty`、`seed`、非流式 usage，以及流式 `stream_options.include_usage`。自定义 API 流式聊天使用 `token`、`error` 和 `done` 事件；OpenAI 风格接口使用 `chat.completion.chunk` 和 `data: [DONE]`。
 
 <p align="right">(<a href="#readme-top">返回顶部</a>)</p>
 
@@ -304,21 +324,13 @@ conda activate mini-ollama-hf
 go test ./...
 go test -race ./...
 go vet ./...
+bash -n scripts/smoke-openai-api.sh
+# 先启动 serve，再执行 smoke 检查
+bash scripts/smoke-openai-api.sh
 python -m unittest discover -s scripts -p 'test_hf_snapshot.py' -v
 ```
 
-当前自动化测试覆盖参数校验、模型目录、HTTP/SSE 客户端、OpenAI 风格模型和聊天接口、SQLite、模型控制、进程就绪检查、HF 导入和 TUI 状态。Linux + CUDA 的最终验收需要分别使用至少一个 1B 和一个 8B GGUF。
-
-<p align="right">(<a href="#readme-top">返回顶部</a>)</p>
-
-# 🗺️ 当前边界
-
-- 一次只加载一个模型。
-- 当前默认单卡 CUDA，不实现自动显存分配。
-- 不实现多模型并行和多卡调度。
-- HTTP API 默认只监听本机，不提供远程认证。
-- 不提供 Web UI 或桌面 UI。OpenAI 风格接口仅覆盖本阶段列出的本地文本聊天子集。
-- Linux + CUDA 是当前主要验收目标，macOS 仍需继续验证。
+当前自动化测试覆盖参数校验、模型目录、HTTP/SSE 客户端、OpenAI 风格模型和聊天接口、SQLite、模型控制、GPU 显存解析、进程就绪检查、HF 导入和 TUI 状态。Linux + CUDA 手工验收建议分别使用一个 1B 和一个 8B GGUF，并检查 `/api/v1/status`、`/api/v1/metrics` 和 `nvidia-smi`。
 
 <p align="right">(<a href="#readme-top">返回顶部</a>)</p>
 
